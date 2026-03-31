@@ -1,0 +1,263 @@
+name: Build InstallerX ColorOS Module
+
+"on":
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Optional upstream prerelease tag, for example 26.03.4d16c34
+        required: false
+        type: string
+      publish_release:
+        description: Create a draft prerelease in this repository
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  build_module:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v6
+
+      - name: Resolve upstream prerelease
+        id: upstream
+        run: |
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            python3 scripts/resolve_upstream_release.py \
+              --repo wxxsfxyzm/InstallerX-Revived \
+              --tag "${{ inputs.upstream_tag }}" \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/resolve_upstream_release.py \
+              --repo wxxsfxyzm/InstallerX-Revived \
+              --github-output "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone upstream source
+        id: clone
+        run: |
+          git clone --branch "${{ steps.upstream.outputs.tag_name }}" --depth 1 \
+            https://github.com/wxxsfxyzm/InstallerX-Revived.git upstream-src
+
+          cd upstream-src
+          actual_short_hash="$(git rev-parse --short=7 HEAD)"
+          actual_commit="$(git rev-parse HEAD)"
+
+          if [ "$actual_short_hash" != "${{ steps.upstream.outputs.short_hash }}" ]; then
+            echo "Expected short hash: ${{ steps.upstream.outputs.short_hash }}"
+            echo "Actual short hash:   $actual_short_hash"
+            exit 1
+          fi
+
+          echo "actual_short_hash=$actual_short_hash" >> "$GITHUB_OUTPUT"
+          echo "actual_commit=$actual_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          build-scan-terms-of-use-url: https://gradle.com/help/legal-terms-of-use
+          build-scan-terms-of-use-agree: "yes"
+          build-scan-publish: false
+
+      - name: Setup signing keys
+        env:
+          SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -z "${SIGNING_KEY_STORE_BASE64:-}" ] || [ -z "${SIGNING_STORE_PASSWORD:-}" ] || [ -z "${SIGNING_KEY_ALIAS:-}" ] || [ -z "${SIGNING_KEY_PASSWORD:-}" ]; then
+            echo "Custom signing secrets missing, upstream build will fall back to debug signing."
+            exit 0
+          fi
+
+          mkdir -p upstream-src/keystore
+          echo "${SIGNING_KEY_STORE_BASE64}" | base64 --decode > upstream-src/keystore/coloros-packageinstaller.jks
+          {
+            echo "storeFile=keystore/coloros-packageinstaller.jks"
+            echo "keyAlias=${SIGNING_KEY_ALIAS}"
+            echo "keyPassword=${SIGNING_KEY_PASSWORD}"
+            echo "storePassword=${SIGNING_STORE_PASSWORD}"
+          } > upstream-src/keystore.properties
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x upstream-src/gradlew
+
+      - name: Build preview release APKs
+        working-directory: upstream-src
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew \
+            assembleOnlinePreviewRelease \
+            assembleOfflinePreviewRelease \
+            -PAPP_ID=com.android.packageinstaller \
+            -PVERSION_NAME="${{ steps.upstream.outputs.base_version }}"
+
+      - name: Resolve aapt path
+        id: aapt
+        run: |
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$sdk_root" ] || [ ! -d "$sdk_root/build-tools" ]; then
+            echo "Android build-tools directory not found."
+            exit 1
+          fi
+
+          aapt_path="$(find "$sdk_root/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          if [ -z "$aapt_path" ]; then
+            echo "aapt not found under $sdk_root/build-tools"
+            exit 1
+          fi
+
+          echo "path=$aapt_path" >> "$GITHUB_OUTPUT"
+
+      - name: Package module artifacts
+        run: |
+          mkdir -p dist
+
+          online_apk_file="$(python3 scripts/read_output_metadata.py \
+            --metadata upstream-src/app/build/outputs/apk/onlinePreview/release/output-metadata.json \
+            --field outputFile)"
+          offline_apk_file="$(python3 scripts/read_output_metadata.py \
+            --metadata upstream-src/app/build/outputs/apk/offlinePreview/release/output-metadata.json \
+            --field outputFile)"
+
+          python3 scripts/package_coloros_module.py \
+            --apk "upstream-src/app/build/outputs/apk/onlinePreview/release/${online_apk_file}" \
+            --metadata upstream-src/app/build/outputs/apk/onlinePreview/release/output-metadata.json \
+            --flavor online \
+            --upstream-tag "${{ steps.upstream.outputs.tag_name }}" \
+            --author "${{ github.repository_owner }}" \
+            --output-dir dist
+
+          python3 scripts/package_coloros_module.py \
+            --apk "upstream-src/app/build/outputs/apk/offlinePreview/release/${offline_apk_file}" \
+            --metadata upstream-src/app/build/outputs/apk/offlinePreview/release/output-metadata.json \
+            --flavor offline \
+            --upstream-tag "${{ steps.upstream.outputs.tag_name }}" \
+            --author "${{ github.repository_owner }}" \
+            --output-dir dist
+
+      - name: Verify APKs and module zips
+        run: |
+          for flavor in online offline; do
+            apk_path="dist/InstallerX-ColorOS-${flavor}-${{ steps.upstream.outputs.tag_name }}.apk"
+            zip_path="dist/InstallerX-ColorOS-Module-${flavor}-${{ steps.upstream.outputs.tag_name }}.zip"
+
+            if [ ! -f "$apk_path" ] || [ ! -f "$zip_path" ]; then
+              echo "Expected artifact missing for flavor: $flavor"
+              exit 1
+            fi
+
+            badging="$("${{ steps.aapt.outputs.path }}" dump badging "$apk_path")"
+            echo "$badging" | grep -F "package: name='com.android.packageinstaller'"
+            echo "$badging" | grep -F "versionName='${{ steps.upstream.outputs.tag_name }}'"
+
+            module_prop="$(unzip -p "$zip_path" module.prop)"
+            printf '%s\n' "$module_prop" | grep -F "id=installerx-coloros-packageinstaller"
+            printf '%s\n' "$module_prop" | grep -F "version=${{ steps.upstream.outputs.tag_name }}"
+            printf '%s\n' "$module_prop" | grep -E '^versionCode=[1-9][0-9]*$'
+            printf '%s\n' "$module_prop" | grep -F "name=InstallerX ColorOS PackageInstaller (${flavor})"
+            printf '%s\n' "$module_prop" | grep -E '^author=.+$'
+            printf '%s\n' "$module_prop" | grep -E '^description=.+$'
+
+            zipinfo -1 "$zip_path" | grep -Fx "module.prop"
+            zipinfo -1 "$zip_path" | grep -Fx "customize.sh"
+            zipinfo -1 "$zip_path" | grep -Fx "action.sh"
+            zipinfo -1 "$zip_path" | grep -Fx "service.sh"
+            zipinfo -1 "$zip_path" | grep -Fx "uninstall.sh"
+            zipinfo -1 "$zip_path" | grep -Fx "META-INF/com/google/android/update-binary"
+            zipinfo -1 "$zip_path" | grep -Fx "META-INF/com/google/android/updater-script"
+            zipinfo -1 "$zip_path" | grep -Fx "system/priv-app/PackageInstaller/PackageInstaller.apk"
+            zipinfo -1 "$zip_path" | grep -E '^system/priv-app/PackageInstaller/lib/.+\.so$'
+          done
+
+      - name: Write release notes
+        run: |
+          cat > dist/release-notes.md <<EOF
+          ## Upstream
+
+          - Repository: \`wxxsfxyzm/InstallerX-Revived\`
+          - Upstream prerelease tag: \`${{ steps.upstream.outputs.tag_name }}\`
+          - Packaging repo release tag: \`coloros-preview-${{ steps.upstream.outputs.tag_name }}\`
+          - Upstream release page: ${{ steps.upstream.outputs.html_url }}
+          - Upstream release target_commitish: \`${{ steps.upstream.outputs.target_commitish }}\`
+          - Resolved upstream commit: \`${{ steps.clone.outputs.actual_commit }}\`
+          - Build channel: \`PreviewRelease\`
+
+          ## Artifacts
+
+          - \`InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}.apk\`
+          - \`InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}.apk\`
+          - \`InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}.zip\`
+          - \`InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}.zip\`
+
+          ## Warnings
+
+          - 这是替换系统安装器的高风险模块。
+          - 需要 metamodule 支持，例如 \`meta-overlayfs\`。
+          - 错误刷入可能导致无法开机或系统异常。
+          - 仅面向 ColorOS；不处理 AOSP 或类原生系统所需的 \`privapp-permissions-platform.xml\`。
+          - \`online\` 与 \`offline\` 是互斥构建，不能同时刷入。
+          EOF
+
+      - name: Upload online APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}
+          path: dist/InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}.apk
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload offline APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}
+          path: dist/InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}.apk
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload online module zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}
+          path: dist/InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}.zip
+          if-no-files-found: error
+          archive: false
+
+      - name: Upload offline module zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}
+          path: dist/InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}.zip
+          if-no-files-found: error
+          archive: false
+
+      - name: Create draft prerelease
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: InstallerX ColorOS PackageInstaller Preview ${{ steps.upstream.outputs.tag_name }}
+          tag_name: coloros-preview-${{ steps.upstream.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          body_path: dist/release-notes.md
+          draft: true
+          prerelease: true
+          files: |
+            dist/InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}.apk
+            dist/InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}.apk
+            dist/InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}.zip
+            dist/InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}.zip
