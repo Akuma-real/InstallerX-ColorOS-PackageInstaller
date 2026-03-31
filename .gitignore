@@ -21,3 +21,4 @@ upstream-src/
 .idea/
 .vscode/
 .DS_Store
+.codex

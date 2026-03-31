@@ -16,23 +16,23 @@ EXPECTED_APP_ID = "com.android.packageinstaller"
 UPDATE_BINARY = """#!/sbin/sh
 
 #################
-# Initialization
+# 初始化
 #################
 
 umask 022
 
-# echo before loading util_functions
+# 在加载 util_functions 之前先定义输出函数
 ui_print() { echo "$1"; }
 
 require_new_magisk() {
   ui_print "*******************************"
-  ui_print " Please install Magisk v20.4+! "
+  ui_print " 请先安装 Magisk v20.4+! "
   ui_print "*******************************"
   exit 1
 }
 
 #########################
-# Load util_functions.sh
+# 加载 util_functions.sh
 #########################
 
 OUTFD=$2
@@ -51,16 +51,16 @@ exit 0
 CUSTOMIZE_TEMPLATE = """# This ensures Magisk extracts the module files automatically
 SKIPUNZIP=0
 
-# UI print command to show status in the flashing console
-ui_print "- Installing PackageInstaller Replacement ({flavor})..."
+# 在刷入界面显示当前安装状态
+ui_print "- 正在安装 PackageInstaller 替换模块（{flavor}）..."
 
-# Define permissions
-# Syntax: set_perm_recursive <directory> <owner> <group> <dir_permission> <file_permission>
-# 0 0 corresponds to root:root
-# 0755 is rwxr-xr-x (required for directories)
-# 0644 is rw-r--r-- (required for system apks)
+# 统一设置 system 目录权限
+# 语法: set_perm_recursive <directory> <owner> <group> <dir_permission> <file_permission>
+# 0 0 对应 root:root
+# 0755 用于目录
+# 0644 用于系统 apk 和 so 文件
 
-ui_print "- Setting permissions..."
+ui_print "- 正在设置模块文件权限..."
 set_perm_recursive "$MODPATH/system" 0 0 0755 0644
 """
 
@@ -130,19 +130,16 @@ def write_module_prop(
     write_text(path, content)
 
 
-def extract_native_libs(apk_path: Path, package_dir: Path) -> bool:
-    found = False
+def extract_native_libs(apk_path: Path, package_dir: Path) -> None:
     with zipfile.ZipFile(apk_path) as apk:
         for member in sorted(apk.namelist()):
             if not member.startswith("lib/") or not member.endswith(".so"):
                 continue
-            found = True
             target = package_dir / member
             target.parent.mkdir(parents=True, exist_ok=True)
             with apk.open(member) as source, target.open("wb") as destination:
                 shutil.copyfileobj(source, destination)
             target.chmod(0o644)
-    return found
 
 
 def zip_tree(root_dir: Path, zip_path: Path) -> None:

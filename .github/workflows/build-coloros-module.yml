@@ -1,17 +1,16 @@
-name: Build InstallerX ColorOS Module
+name: 构建 InstallerX ColorOS 系统安装器模块
 
 "on":
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: Optional upstream prerelease tag, for example 26.03.4d16c34
+        description: 可选，上游 prerelease 标签，例如 26.03.4d16c34
         required: false
         type: string
-      publish_release:
-        description: Create a draft prerelease in this repository
-        required: false
-        default: true
-        type: boolean
+
+concurrency:
+  group: build-coloros-module-${{ inputs.upstream_tag || 'latest-prerelease' }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -22,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout packaging repository
+      - name: 检出当前包装仓库
         uses: actions/checkout@v6
 
-      - name: Resolve upstream prerelease
+      - name: 解析上游 prerelease
         id: upstream
         run: |
           if [ -n "${{ inputs.upstream_tag }}" ]; then
@@ -39,7 +38,7 @@ jobs:
               --github-output "$GITHUB_OUTPUT"
           fi
 
-      - name: Clone upstream source
+      - name: 克隆上游源码
         id: clone
         run: |
           git clone --branch "${{ steps.upstream.outputs.tag_name }}" --depth 1 \
@@ -50,37 +49,47 @@ jobs:
           actual_commit="$(git rev-parse HEAD)"
 
           if [ "$actual_short_hash" != "${{ steps.upstream.outputs.short_hash }}" ]; then
-            echo "Expected short hash: ${{ steps.upstream.outputs.short_hash }}"
-            echo "Actual short hash:   $actual_short_hash"
+            echo "上游提交短哈希校验失败。"
+            echo "期望短哈希: ${{ steps.upstream.outputs.short_hash }}"
+            echo "实际短哈希: $actual_short_hash"
             exit 1
           fi
 
           echo "actual_short_hash=$actual_short_hash" >> "$GITHUB_OUTPUT"
           echo "actual_commit=$actual_commit" >> "$GITHUB_OUTPUT"
 
-      - name: Set up JDK 25
+      - name: 配置 JDK 25
         uses: actions/setup-java@v5
         with:
           distribution: zulu
           java-version: "25"
 
-      - name: Setup Gradle
+      - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
           build-scan-terms-of-use-url: https://gradle.com/help/legal-terms-of-use
           build-scan-terms-of-use-agree: "yes"
           build-scan-publish: false
 
-      - name: Setup signing keys
+      - name: 检查并导入签名
         env:
           SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          if [ -z "${SIGNING_KEY_STORE_BASE64:-}" ] || [ -z "${SIGNING_STORE_PASSWORD:-}" ] || [ -z "${SIGNING_KEY_ALIAS:-}" ] || [ -z "${SIGNING_KEY_PASSWORD:-}" ]; then
-            echo "Custom signing secrets missing, upstream build will fall back to debug signing."
-            exit 0
+          missing_keys=""
+          for key in SIGNING_KEY_STORE_BASE64 SIGNING_STORE_PASSWORD SIGNING_KEY_ALIAS SIGNING_KEY_PASSWORD; do
+            eval "value=\${$key:-}"
+            if [ -z "$value" ]; then
+              missing_keys="${missing_keys} ${key}"
+            fi
+          done
+
+          if [ -n "$missing_keys" ]; then
+            echo "缺少签名 secrets，禁止继续发布高风险系统安装器模块。"
+            echo "缺少的 secrets:${missing_keys}"
+            exit 1
           fi
 
           mkdir -p upstream-src/keystore
@@ -92,10 +101,10 @@ jobs:
             echo "storePassword=${SIGNING_STORE_PASSWORD}"
           } > upstream-src/keystore.properties
 
-      - name: Grant execute permission for gradlew
+      - name: 授予 gradlew 可执行权限
         run: chmod +x upstream-src/gradlew
 
-      - name: Build preview release APKs
+      - name: 构建 Preview Release APK
         working-directory: upstream-src
         env:
           GITHUB_ACTOR: ${{ github.actor }}
@@ -107,24 +116,24 @@ jobs:
             -PAPP_ID=com.android.packageinstaller \
             -PVERSION_NAME="${{ steps.upstream.outputs.base_version }}"
 
-      - name: Resolve aapt path
+      - name: 定位 aapt 工具
         id: aapt
         run: |
           sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           if [ -z "$sdk_root" ] || [ ! -d "$sdk_root/build-tools" ]; then
-            echo "Android build-tools directory not found."
+            echo "未找到 Android build-tools 目录。"
             exit 1
           fi
 
           aapt_path="$(find "$sdk_root/build-tools" -type f -name aapt | sort -V | tail -n 1)"
           if [ -z "$aapt_path" ]; then
-            echo "aapt not found under $sdk_root/build-tools"
+            echo "在 $sdk_root/build-tools 下未找到 aapt。"
             exit 1
           fi
 
           echo "path=$aapt_path" >> "$GITHUB_OUTPUT"
 
-      - name: Package module artifacts
+      - name: 打包模块产物
         run: |
           mkdir -p dist
 
@@ -151,14 +160,14 @@ jobs:
             --author "${{ github.repository_owner }}" \
             --output-dir dist
 
-      - name: Verify APKs and module zips
+      - name: 校验 APK 与模块 zip
         run: |
           for flavor in online offline; do
             apk_path="dist/InstallerX-ColorOS-${flavor}-${{ steps.upstream.outputs.tag_name }}.apk"
             zip_path="dist/InstallerX-ColorOS-Module-${flavor}-${{ steps.upstream.outputs.tag_name }}.zip"
 
             if [ ! -f "$apk_path" ] || [ ! -f "$zip_path" ]; then
-              echo "Expected artifact missing for flavor: $flavor"
+              echo "缺少 ${flavor} 产物文件。"
               exit 1
             fi
 
@@ -185,27 +194,27 @@ jobs:
             zipinfo -1 "$zip_path" | grep -E '^system/priv-app/PackageInstaller/lib/.+\.so$'
           done
 
-      - name: Write release notes
+      - name: 生成发布说明
         run: |
           cat > dist/release-notes.md <<EOF
-          ## Upstream
+          ## 上游信息
 
-          - Repository: \`wxxsfxyzm/InstallerX-Revived\`
-          - Upstream prerelease tag: \`${{ steps.upstream.outputs.tag_name }}\`
-          - Packaging repo release tag: \`coloros-preview-${{ steps.upstream.outputs.tag_name }}\`
-          - Upstream release page: ${{ steps.upstream.outputs.html_url }}
-          - Upstream release target_commitish: \`${{ steps.upstream.outputs.target_commitish }}\`
-          - Resolved upstream commit: \`${{ steps.clone.outputs.actual_commit }}\`
-          - Build channel: \`PreviewRelease\`
+          - 上游仓库：\`wxxsfxyzm/InstallerX-Revived\`
+          - 上游 prerelease 标签：\`${{ steps.upstream.outputs.tag_name }}\`
+          - 当前包装仓库 release tag：\`coloros-preview-${{ steps.upstream.outputs.tag_name }}\`
+          - 上游发布页：${{ steps.upstream.outputs.html_url }}
+          - 上游 release target_commitish：\`${{ steps.upstream.outputs.target_commitish }}\`
+          - 实际解析出的上游提交：\`${{ steps.clone.outputs.actual_commit }}\`
+          - 构建通道：\`PreviewRelease\`
 
-          ## Artifacts
+          ## 产物列表
 
           - \`InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}.apk\`
           - \`InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}.apk\`
           - \`InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}.zip\`
           - \`InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}.zip\`
 
-          ## Warnings
+          ## 风险提示
 
           - 这是替换系统安装器的高风险模块。
           - 需要 metamodule 支持，例如 \`meta-overlayfs\`。
@@ -214,7 +223,7 @@ jobs:
           - \`online\` 与 \`offline\` 是互斥构建，不能同时刷入。
           EOF
 
-      - name: Upload online APK
+      - name: 上传 online APK
         uses: actions/upload-artifact@v7
         with:
           name: InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}
@@ -222,7 +231,7 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Upload offline APK
+      - name: 上传 offline APK
         uses: actions/upload-artifact@v7
         with:
           name: InstallerX-ColorOS-offline-${{ steps.upstream.outputs.tag_name }}
@@ -230,7 +239,7 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Upload online module zip
+      - name: 上传 online 模块 zip
         uses: actions/upload-artifact@v7
         with:
           name: InstallerX-ColorOS-Module-online-${{ steps.upstream.outputs.tag_name }}
@@ -238,7 +247,7 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Upload offline module zip
+      - name: 上传 offline 模块 zip
         uses: actions/upload-artifact@v7
         with:
           name: InstallerX-ColorOS-Module-offline-${{ steps.upstream.outputs.tag_name }}
@@ -246,15 +255,15 @@ jobs:
           if-no-files-found: error
           archive: false
 
-      - name: Create draft prerelease
-        if: ${{ inputs.publish_release }}
-        uses: softprops/action-gh-release@v2
+      - name: 创建公开 prerelease
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2.6.1
         with:
           name: InstallerX ColorOS PackageInstaller Preview ${{ steps.upstream.outputs.tag_name }}
           tag_name: coloros-preview-${{ steps.upstream.outputs.tag_name }}
           target_commitish: ${{ github.sha }}
           body_path: dist/release-notes.md
-          draft: true
+          draft: false
           prerelease: true
           files: |
             dist/InstallerX-ColorOS-online-${{ steps.upstream.outputs.tag_name }}.apk
